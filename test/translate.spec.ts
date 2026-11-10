@@ -24,6 +24,7 @@ import {
   toAnthropicMessages,
   toAnthropicSystem,
   toAnthropicTools,
+  volatileTailBlocks,
 } from '../src/translate/anthropic.js'
 import type { AnthropicMessage, AnthropicStreamEvent } from '../src/translate/anthropic.js'
 import { resolveImages, type TranslatableMessage } from '../src/translate/resolved.js'
@@ -697,6 +698,98 @@ test('markMessageCache and toAnthropicSystem apply one TTL to every mark they pl
   ])
 })
 
+/** A context snapshot as the harness sends it: user role, `form: 'snapshot'`. */
+function snapshot(kind: string, text: string): TranslatableMessage {
+  return {
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind, form: 'snapshot', sections: [{ name: kind, text }] } as unknown as MessageSource,
+  } as TranslatableMessage
+}
+
+test('volatileTailBlocks counts only the trailing run of snapshot messages', () => {
+  const history: TranslatableMessage[] = [
+    message('user', [{ type: 'text', text: 'ask' }]),
+    snapshot('runtime-context', 'old state, left in place'),
+    message('assistant', [{ type: 'text', text: 'answer' }]),
+    message('user', [{ type: 'text', text: 'ask again' }]),
+  ]
+  assert.equal(volatileTailBlocks([]), 0)
+  assert.equal(volatileTailBlocks(history), 0)
+  assert.equal(volatileTailBlocks([...history, snapshot('runtime-context', 'state')]), 1)
+  assert.equal(
+    volatileTailBlocks([...history, snapshot('time-context', 'now'), snapshot('runtime-context', 'state')]),
+    2,
+  )
+  // A user message that only looks like context is ordinary history.
+  assert.equal(volatileTailBlocks([...history, message('user', [{ type: 'text', text: 'Current runtime context.' }])]), 0)
+})
+
+test('markMessageCache anchors its marks ahead of the volatile tail', () => {
+  const content: Record<string, unknown>[] = Array.from(
+    { length: 40 },
+    (_, index) => ({ type: 'text', text: `b${index}` }),
+  )
+  markMessageCache([{ role: 'user', content }], undefined, 2)
+  const marked = content.flatMap((block, index) => 'cache_control' in block ? [index] : [])
+  assert.deepEqual(marked, [7, 22, 37])
+})
+
+test('markMessageCache marks the last block when the request is only its volatile tail', () => {
+  const content: Record<string, unknown>[] = [{ type: 'text', text: 'state' }]
+  markMessageCache([{ role: 'user', content }], undefined, 1)
+  assert.deepEqual(content, [{ type: 'text', text: 'state', cache_control: { type: 'ephemeral' } }])
+})
+
+test('with the snapshot moved last, each request reads the entry the previous one wrote', () => {
+  // The host keeps only the newest snapshot and places it last: the history
+  // ahead of it only grows, the snapshot's text changes on every request.
+  const history: TranslatableMessage[] = [message('user', [{ type: 'text', text: 'start' }])]
+  /** The translated blocks up to and including the first mark, as one string: a cache key. */
+  const keys = (step: number): { marks: string[], prefixes: Set<string> } => {
+    const messages = [...history, snapshot('runtime-context', `state at step ${step}`)]
+    const out = toAnthropicMessages(messages)
+    markMessageCache(out, undefined, volatileTailBlocks(messages))
+    const blocks = out.flatMap(m => m.content)
+    const marks: string[] = []
+    const prefixes = new Set<string>()
+    let prefix = ''
+    for (const block of blocks) {
+      const { cache_control: mark, ...rest } = block
+      prefix += JSON.stringify(rest)
+      prefixes.add(prefix)
+      if (mark !== undefined) marks.push(prefix)
+    }
+    return { marks, prefixes }
+  }
+
+  let previous = keys(0)
+  for (let step = 1; step <= 12; step++) {
+    // one agent step: an assistant tool call and its result
+    history.push(message('assistant', [toolCall(`call_${step}`, 'bash', '{"command":"ls"}')]))
+    history.push(message('user', [toolResult(`call_${step}`, `listing ${step}`)], { kind: 'tool', callId: ToolCallId(`call_${step}`) } as MessageSource))
+    const current = keys(step)
+    // The newest entry the previous request wrote is a prefix of this request:
+    // that is the read. Without the volatile tail it would end on the old
+    // snapshot text and match nothing.
+    const newest = previous.marks[previous.marks.length - 1]
+    assert.ok(current.prefixes.has(newest), `step ${step} does not repeat the prefix step ${step - 1} cached`)
+    // And no mark sits on the snapshot itself.
+    assert.ok(current.marks.every(mark => !mark.includes(`state at step ${step}`)))
+    previous = current
+  }
+})
+
+test('without the volatile tail, a moving last snapshot leaves the newest entry unreadable', () => {
+  // The behaviour this change replaces, kept as a record of why: marking the
+  // snapshot writes an entry whose prefix the next request never repeats.
+  const first = [message('user', [{ type: 'text', text: 'start' }]), snapshot('runtime-context', 'state 0')]
+  const out = toAnthropicMessages(first)
+  markMessageCache(out)
+  const marked = out.flatMap(m => m.content).filter(block => 'cache_control' in block)
+  assert.equal(marked.length, 1)
+  assert.equal(marked[0].text, 'state 0')
+})
 test('toAnthropicTools maps to input_schema tools', () => {
   assert.deepEqual(toAnthropicTools([{ name: 'bash', description: 'run', parameters: { type: 'object' } }]), [
     { name: 'bash', description: 'run', input_schema: { type: 'object' } },
