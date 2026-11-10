@@ -673,6 +673,33 @@ function claudeMessage(id: string, role: Exclude<Message['role'], 'tool'>, text:
   return { id: MessageId(id), role, content, source: { kind: 'user' } }
 }
 
+test('claudeRequestBody leaves a trailing context snapshot unmarked and marks the block ahead of it', () => {
+  const history: Message[] = [
+    claudeMessage('u0', 'user', 'q0'),
+    claudeMessage('a0', 'assistant', 'r0'),
+    claudeMessage('u1', 'user', 'q1'),
+    {
+      id: MessageId('ctx'),
+      role: 'user',
+      content: [{ type: 'text', text: 'Current runtime context.' }],
+      source: { kind: 'runtime-context', form: 'snapshot', sections: [] } as unknown as Message['source'],
+    },
+  ]
+  const body = claudeRequestBody(
+    { provider: 'claude', model: 'claude-opus-5', messages: history },
+    history,
+    1024,
+    undefined,
+  )
+  const blocks = (body.messages as { content: Record<string, unknown>[] }[]).flatMap(m => m.content)
+  // q1 and the snapshot merge into one user message; the mark sits on q1.
+  assert.deepEqual(blocks.map(block => [block.text, 'cache_control' in block]), [
+    ['q0', false],
+    ['r0', false],
+    ['q1', true],
+    ['Current runtime context.', false],
+  ])
+})
 test('claudeRequestBody ships the cache breakpoints and never exceeds four', () => {
   const history: Message[] = [claudeMessage('s0', 'system', 'opening')]
   for (let turn = 0; turn < 16; turn++) {

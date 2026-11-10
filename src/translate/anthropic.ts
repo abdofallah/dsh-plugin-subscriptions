@@ -164,6 +164,48 @@ export function sanitizeToolId(id: string): string {
 }
 
 /**
+ * Whether a message is a context snapshot: a user-role message whose source
+ * declares `form: 'snapshot'` (the runtime context, the time context). A
+ * snapshot restates state that changes between requests, so its bytes are
+ * not expected to repeat in the next request.
+ * @param message - one conversation message.
+ * @returns true when the message is a declared snapshot.
+ */
+function isSnapshot(message: TranslatableMessage): boolean {
+  const source = message.source as { form?: unknown } | undefined
+  return message.role === 'user' && source?.form === 'snapshot'
+}
+
+/**
+ * Count the Anthropic content blocks that the trailing run of snapshot
+ * messages contributes: the volatile tail of the request.
+ *
+ * A host may send only the newest snapshot of each kind and place it last, so
+ * the history ahead of it stays byte-identical from one request to the next
+ * and only the snapshot changes. {@link markMessageCache} then has to anchor
+ * its marks on the block just ahead of that tail: a mark on the snapshot
+ * itself would write an entry no later request can read.
+ *
+ * Only the run at the very end counts. A snapshot the host left in place in
+ * the middle of the history repeats byte for byte and is ordinary history.
+ * @param messages - ordered conversation messages with resolved images.
+ * @returns how many trailing blocks of the translated request are volatile.
+ */
+export function volatileTailBlocks(messages: readonly TranslatableMessage[]): number {
+  let count = 0
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (!isSnapshot(message)) break
+    // Mirrors toAnthropicMessages: text and resolved images become one block
+    // each; nothing else can ride in a user-role snapshot.
+    for (const block of message.content) {
+      if (block.type === 'text' || (block.type === 'image' && 'dataBase64' in block)) count++
+    }
+  }
+  return count
+}
+
+/**
  * Convert harness messages into Anthropic messages. Consecutive same-role
  * messages merge into one message with multiple content blocks; tool results
  * arrive as user messages with `tool_result` blocks, which a merged user
@@ -271,13 +313,26 @@ export function toAnthropicMessages(messages: readonly TranslatableMessage[]): A
  * byte-identical in the next — that entry is what the next request reads.
  * Marks are counted across the flattened block sequence, not per message,
  * because the lookback window Anthropic walks counts blocks the same way.
+ *
+ * `volatileTail` trailing blocks (see {@link volatileTailBlocks}) are left
+ * unmarked and the marks are anchored on the block ahead of them: those
+ * blocks change on every request, so an entry ending on one is never read,
+ * while the history ahead of them is still append-only. A request that is
+ * nothing but its volatile tail is marked at its last block, as before, so a
+ * first request still writes an entry.
  * @param messages - assembled Anthropic messages, marked in place.
  * @param ttl - cache lifetime for every mark; defaults to five minutes.
+ * @param volatileTail - trailing blocks to leave unmarked; defaults to none.
  */
-export function markMessageCache(messages: readonly AnthropicMessage[], ttl?: PromptCacheTtl): void {
+export function markMessageCache(
+  messages: readonly AnthropicMessage[],
+  ttl?: PromptCacheTtl,
+  volatileTail = 0,
+): void {
   const blocks = messages.flatMap(message => message.content)
+  const skip = volatileTail > 0 && volatileTail < blocks.length ? volatileTail : 0
   for (let mark = 0; mark < MESSAGE_CACHE_BREAKPOINTS; mark++) {
-    const at = blocks.length - 1 - mark * CACHE_BLOCK_STRIDE
+    const at = blocks.length - 1 - skip - mark * CACHE_BLOCK_STRIDE
     if (at < 0) return
     blocks[at].cache_control = cacheControl(ttl)
   }

@@ -26,6 +26,7 @@ import {
   toAnthropicMessages,
   toAnthropicSystem,
   toAnthropicTools,
+  volatileTailBlocks,
 } from '../translate/anthropic.js'
 import type { PromptCacheTtl } from '../translate/anthropic.js'
 import {
@@ -620,7 +621,8 @@ export function claudeRequestBody(
 ): Record<string, unknown> {
   const ttl = options.purpose === undefined ? cacheTtl : undefined
   const anthropicMessages = toAnthropicMessages(messages)
-  markMessageCache(anthropicMessages, ttl)
+  // Trailing context snapshots change on every request: anchor the marks ahead of them.
+  markMessageCache(anthropicMessages, ttl, volatileTailBlocks(messages))
   return {
     model: options.model,
     max_tokens: maxTokens,
